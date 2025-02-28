@@ -1,0 +1,12 @@
+fastapi==0.104.1
+uvicorn[standard]==0.23.2
+pydantic==2.4.2
+python-dotenv==1.0.0
+TTS==0.22.0
+numpy==1.22.0
+httpx==0.25.0
+torch==2.1.0
+torchaudio==2.1.0
+deepspeed==0.16.4
+python-multipart==0.0.6
+boto3==1.28.40

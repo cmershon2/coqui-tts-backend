@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  tts-api:
+    build: .
+    container_name: tts-api
+    volumes:
+      - ./.env:/app/.env
+    ports:
+      - "8000:8000"
+    environment:
+      - LOCAL_MODEL_DIR=/app/models/xtts_v2
+      - USE_DEEPSPEED=true
+      - USE_CUDA=true
+      - CACHE_MAX_SIZE=100
+      - USE_S3=true
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_MODEL_PATH=${S3_MODEL_PATH}
+      - SPACES_KEY=${SPACES_KEY}
+      - SPACES_SECRET=${SPACES_SECRET}
+      - DO_REGION=${DO_REGION}
+      - DO_ENDPOINT_URL=${DO_ENDPOINT_URL}
+      - ALLOWED_ORIGINS=["http://localhost:3000", "https://your-frontend-domain.com"]
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
