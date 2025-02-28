@@ -2,7 +2,7 @@ name: Build Docker Image
 
 on:
   push:
-    branches: [ "main" ]  # Change to your main branch name
+    branches: [ "master" ]  # Change to your main branch name
   
   # To allow manual runs from the GitHub UI:
   workflow_dispatch:
