@@ -2,7 +2,7 @@ name: Build Docker Image
 
 on:
   push:
-    branches: [ "master" ]  # Change to your main branch name
+    branches: [ "master" ]
   
   # To allow manual runs from the GitHub UI:
   workflow_dispatch:
@@ -44,7 +44,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Optional: Verify the build
+      # Verify the build
       - name: Verify Docker image
         run: |
           echo "Docker image built successfully:"
