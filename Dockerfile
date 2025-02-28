@@ -22,12 +22,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set up working directory
 WORKDIR /app
 
-# Install Python dependencies
-COPY requirements.txt .
+# Copy requirements files
+COPY requirements.txt requirements-optional.txt ./
 
 # Install PyTorch with GPU support
 RUN pip3 install --no-cache-dir torch==2.1.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+
+# Install required dependencies
 RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Conditionally install DeepSpeed (will be skipped in CI environments without CUDA)
+ARG INSTALL_DEEPSPEED=true
+RUN if [ "$INSTALL_DEEPSPEED" = "true" ] && [ -f /usr/local/cuda/bin/nvcc ]; then \
+    pip3 install --no-cache-dir -r requirements-optional.txt; \
+    else \
+    echo "Skipping DeepSpeed installation"; \
+    fi
 
 # Create model directory
 RUN mkdir -p /app/models

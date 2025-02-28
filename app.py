@@ -21,6 +21,15 @@ from dotenv import load_dotenv
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 
+# Check if DeepSpeed is available
+try:
+    import deepspeed
+    HAS_DEEPSPEED = True
+    logging.info("DeepSpeed is available")
+except ImportError:
+    HAS_DEEPSPEED = False
+    logging.info("DeepSpeed is not available, will use PyTorch only")
+
 # Load environment variables
 load_dotenv()
 
@@ -51,7 +60,8 @@ app.add_middleware(
 LOCAL_MODEL_DIR = os.getenv("LOCAL_MODEL_DIR", "./models/xtts_v2")
 MODEL_PATH = LOCAL_MODEL_DIR
 CHECKPOINT_DIR = LOCAL_MODEL_DIR
-USE_DEEPSPEED = os.getenv("USE_DEEPSPEED", "True").lower() in ("true", "1", "t")
+# Only use DeepSpeed if it's available and enabled
+USE_DEEPSPEED = HAS_DEEPSPEED and os.getenv("USE_DEEPSPEED", "True").lower() in ("true", "1", "t")
 USE_CUDA = torch.cuda.is_available() and os.getenv("USE_CUDA", "True").lower() in ("true", "1", "t")
 SAMPLE_RATE = 24000  # XTTS uses 24kHz
 
@@ -254,6 +264,15 @@ def load_model():
     config.load_json(config_path)
     model = Xtts.init_from_config(config)
 
+    # Log DeepSpeed status
+    if USE_DEEPSPEED:
+        logger.info("Loading model with DeepSpeed optimization")
+    else:
+        if HAS_DEEPSPEED:
+            logger.info("DeepSpeed is available but disabled by configuration")
+        else:
+            logger.info("DeepSpeed is not available, using PyTorch only")
+
     checkpoint_path = CHECKPOINT_DIR
     model.load_checkpoint(config, checkpoint_dir=checkpoint_path, use_deepspeed=USE_DEEPSPEED)
 
@@ -353,7 +372,16 @@ async def health_check():
     """Health check endpoint"""
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    return {"status": "healthy", "model": "xtts_v2"}
+    
+    # Add DeepSpeed status to health check
+    return {
+        "status": "healthy", 
+        "model": "xtts_v2",
+        "deepspeed_available": HAS_DEEPSPEED,
+        "deepspeed_enabled": USE_DEEPSPEED,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_enabled": USE_CUDA
+    }
 
 
 @app.get("/speakers")

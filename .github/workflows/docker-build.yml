@@ -40,6 +40,9 @@ jobs:
           load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Skip DeepSpeed installation in CI environment
+          build-args: |
+            INSTALL_DEEPSPEED=false
           # Cache Docker layers for faster builds
           cache-from: type=gha
           cache-to: type=gha,mode=max

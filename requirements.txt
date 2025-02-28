@@ -7,6 +7,5 @@ numpy==1.22.0
 httpx==0.25.0
 torch==2.1.0
 torchaudio==2.1.0
-deepspeed==0.16.4
 python-multipart==0.0.6
 boto3==1.28.40
