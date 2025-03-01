@@ -701,8 +701,6 @@ async def websocket_tts(websocket: WebSocket):
     user_id = None
     
     try:
-        # Accept the connection initially
-        await websocket.accept()
         
         # Wait for authentication message
         auth_message = await websocket.receive_json()
