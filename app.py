@@ -146,12 +146,6 @@ class TTSRequest(BaseModel):
     language: str = "en"
     speaker_wav: Optional[List[str]] = None
     speaker_name: Optional[str] = None
-    speed: float = 1.0
-    temperature: float = 0.65
-    length_penalty: float = 1.0
-    repetition_penalty: float = 2.0
-    top_k: int = 50
-    top_p: float = 0.8
     enable_text_splitting: bool = True
 
     class Config:
@@ -450,12 +444,6 @@ async def send_audio_chunks_to_websocket(
         language: str, 
         gpt_cond_latent, 
         speaker_embedding,
-        speed=1.0, 
-        temperature=0.65, 
-        length_penalty=1.0,
-        repetition_penalty=2.0, 
-        top_k=50, 
-        top_p=0.8, 
         **kwargs
 ):
     """Generate audio and send chunks to a WebSocket connection"""
@@ -466,75 +454,50 @@ async def send_audio_chunks_to_websocket(
             "message": "Starting audio generation"
         })
         
-        # Log all parameters for debugging
-        logger.info(f"TTS parameters: text='{text[:50]}...', language={language}, " +
-                   f"speed={speed}, temperature={temperature}, top_k={top_k}, top_p={top_p}, " +
-                   f"length_penalty={length_penalty}, repetition_penalty={repetition_penalty}")
+        # Log parameters for debugging
+        logger.info(f"TTS parameters: text='{text[:50]}...', language={language}")
         
-        # Check parameter types - convert to proper types if needed
-        speed = float(speed)
-        temperature = float(temperature)
-        length_penalty = float(length_penalty)
-        repetition_penalty = float(repetition_penalty)
-        top_k = int(top_k)
-        top_p = float(top_p)
+        # Stream the audio in chunks - SIMPLIFIED TO MATCH COQUI EXAMPLE
+        chunk_generator = model.inference_stream(
+            text=text,
+            language=language,
+            gpt_cond_latent=gpt_cond_latent,
+            speaker_embedding=speaker_embedding,
+            enable_text_splitting=True
+        )
+            
+        # Stream each audio chunk to the client
+        for chunk in chunk_generator:
+            # Convert chunk to WAV format
+            wav_chunk = chunk.cpu().numpy().astype(np.float32)
+            
+            # Create wave file in memory
+            buffer = io.BytesIO()
+            with io.BytesIO() as audio_buffer:
+                torchaudio.save(
+                    audio_buffer,
+                    torch.tensor(wav_chunk).unsqueeze(0),
+                    SAMPLE_RATE,
+                    format="wav"
+                )
+                audio_buffer.seek(0)
+                buffer.write(audio_buffer.read())
+            
+            buffer.seek(0)
+            
+            # Send chunk to client
+            await manager.send_audio_chunk(connection_id, buffer.read())
+            
+        # Send a completion message
+        await manager.send_message(connection_id, {
+            "type": "complete",
+            "message": "Audio generation complete"
+        })
         
-        # Get generator from model
-        try:
-            chunk_generator = model.inference_stream(
-                text=text,
-                language=language,
-                gpt_cond_latent=gpt_cond_latent,
-                speaker_embedding=speaker_embedding,
-                speed=speed,
-                temperature=temperature,
-                length_penalty=length_penalty,
-                repetition_penalty=repetition_penalty,
-                top_k=top_k,
-                top_p=top_p,
-                pad_token_id=0,
-                **kwargs
-            )
-            
-            # Stream each audio chunk to the client
-            for chunk in chunk_generator:
-                # Convert chunk to WAV format
-                wav_chunk = chunk.cpu().numpy().astype(np.float32)
-                
-                # Create wave file in memory
-                buffer = io.BytesIO()
-                with io.BytesIO() as audio_buffer:
-                    torchaudio.save(
-                        audio_buffer,
-                        torch.tensor(wav_chunk).unsqueeze(0),
-                        SAMPLE_RATE,
-                        format="wav"
-                    )
-                    audio_buffer.seek(0)
-                    buffer.write(audio_buffer.read())
-                
-                buffer.seek(0)
-                
-                # Send chunk to client
-                await manager.send_audio_chunk(connection_id, buffer.read())
-                
-            # Send a completion message
-            await manager.send_message(connection_id, {
-                "type": "complete",
-                "message": "Audio generation complete"
-            })
-            
-        except AttributeError as e:
-            # Handle specific attribute errors
-            if "_pad_token_tensor" in str(e):
-                logger.error(f"Model initialization error - pad token issue: {str(e)}")
-                await manager.send_error(connection_id, "Model initialization error. Please try again with simpler parameters.")
-            else:
-                raise
-                
     except Exception as e:
         logger.error(f"Error in WebSocket streaming: {str(e)}")
         await manager.send_error(connection_id, f"Error generating audio: {str(e)}")
+
 
 @app.get("/health")
 async def health_check():
