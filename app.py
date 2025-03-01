@@ -92,9 +92,9 @@ class ConnectionManager:
         self.user_connections: Dict[str, Set[str]] = {}  # Map user_id to set of connection_ids
 
     async def connect(self, websocket: WebSocket, connection_id: str, user_id: str):
-        await websocket.accept()
+        # await websocket.accept()
         self.active_connections[connection_id] = websocket
-        
+    
         # Add connection to user's list
         if user_id not in self.user_connections:
             self.user_connections[user_id] = set()
@@ -701,6 +701,9 @@ async def websocket_tts(websocket: WebSocket):
     user_id = None
     
     try:
+
+        await websocket.accept()
+        logger.info(f"WebSocket connection accepted: {connection_id}")
         
         # Wait for authentication message
         auth_message = await websocket.receive_json()
@@ -716,15 +719,15 @@ async def websocket_tts(websocket: WebSocket):
             user_data = await validate_token(auth_message["token"])
             user_id = user_data.user_id
             
-            # Now complete the connection process with the connection manager
-            await manager.connect(websocket, connection_id, user_id)
-            
-            # Send welcome message
-            await manager.send_message(connection_id, {
+            # Send welcome message directly (without using ConnectionManager yet)
+            await websocket.send_json({
                 "type": "connected",
                 "message": "Connection established",
                 "user_id": user_id
             })
+            
+            # Now add to connection manager
+            await manager.connect(websocket, connection_id, user_id)
             
             # Main message processing loop
             while True:
