@@ -92,9 +92,9 @@ class ConnectionManager:
         self.user_connections: Dict[str, Set[str]] = {}  # Map user_id to set of connection_ids
 
     async def connect(self, websocket: WebSocket, connection_id: str, user_id: str):
-        # await websocket.accept()
+        # Don't accept again - the websocket is already accepted in the handler
         self.active_connections[connection_id] = websocket
-    
+        
         # Add connection to user's list
         if user_id not in self.user_connections:
             self.user_connections[user_id] = set()
@@ -153,9 +153,7 @@ class TTSRequest(BaseModel):
             "example": {
                 "text": "Hello, this is a test of the text to speech system.",
                 "language": "en",
-                "speaker_name": "Ana Florence",
-                "speed": 1.0,
-                "temperature": 0.65
+                "speaker_name": "Ana Florence"
             }
         }
 
@@ -163,12 +161,6 @@ class TTSRequest(BaseModel):
 class TokenValidationResponse(BaseModel):
     user_id: str
     role: str
-
-
-# WebSocket message model
-class WebSocketTTSRequest(BaseModel):
-    token: str
-    request: TTSRequest
 
 
 # Global model variable
@@ -330,12 +322,6 @@ def load_model():
         raise FileNotFoundError(f"Config file not found at {config_path}")
 
     config.load_json(config_path)
-    
-    # Add these lines to explicitly set tokenizer parameters
-    if hasattr(config, 'tokenizer'):
-        if not hasattr(config.tokenizer, 'pad_token_id') or config.tokenizer.pad_token_id is None:
-            config.tokenizer.pad_token_id = 0  # Set a default value
-    
     model = Xtts.init_from_config(config)
 
     # Log DeepSpeed status
@@ -386,16 +372,14 @@ async def get_speaker_embedding(speaker_key, speaker_files=None, speaker_name=No
 
 
 async def generate_audio_chunks(
-        text, language, gpt_cond_latent, speaker_embedding,
-        speed=1.0, temperature=0.65, length_penalty=1.0,
-        repetition_penalty=2.0, top_k=50, top_p=0.8, **kwargs
+        text, language, gpt_cond_latent, speaker_embedding, enable_text_splitting=True
 ):
-    """Generate audio in chunks for streaming"""
+    """Generate audio in chunks for streaming - simplified to match Coqui's example"""
     try:
         # Use executor to avoid blocking the event loop
         loop = asyncio.get_event_loop()
 
-        # Get generator from model
+        # Get generator from model with minimal parameters, following Coqui's example
         chunk_generator = await loop.run_in_executor(
             None,
             lambda: model.inference_stream(
@@ -403,13 +387,7 @@ async def generate_audio_chunks(
                 language=language,
                 gpt_cond_latent=gpt_cond_latent,
                 speaker_embedding=speaker_embedding,
-                speed=speed,
-                temperature=temperature,
-                length_penalty=length_penalty,
-                repetition_penalty=repetition_penalty,
-                top_k=top_k,
-                top_p=top_p,
-                **kwargs
+                enable_text_splitting=enable_text_splitting
             )
         )
 
@@ -444,9 +422,9 @@ async def send_audio_chunks_to_websocket(
         language: str, 
         gpt_cond_latent, 
         speaker_embedding,
-        **kwargs
+        enable_text_splitting=True
 ):
-    """Generate audio and send chunks to a WebSocket connection"""
+    """Generate audio and send chunks to a WebSocket connection - simplified to match Coqui's example"""
     try:
         # Send a start message
         await manager.send_message(connection_id, {
@@ -457,15 +435,19 @@ async def send_audio_chunks_to_websocket(
         # Log parameters for debugging
         logger.info(f"TTS parameters: text='{text[:50]}...', language={language}")
         
-        # Stream the audio in chunks - SIMPLIFIED TO MATCH COQUI EXAMPLE
-        chunk_generator = model.inference_stream(
-            text=text,
-            language=language,
-            gpt_cond_latent=gpt_cond_latent,
-            speaker_embedding=speaker_embedding,
-            enable_text_splitting=True
+        # Get generator from model with minimal parameters, following Coqui's example
+        loop = asyncio.get_event_loop()
+        chunk_generator = await loop.run_in_executor(
+            None,
+            lambda: model.inference_stream(
+                text=text,
+                language=language,
+                gpt_cond_latent=gpt_cond_latent,
+                speaker_embedding=speaker_embedding,
+                enable_text_splitting=enable_text_splitting
+            )
         )
-            
+        
         # Stream each audio chunk to the client
         for chunk in chunk_generator:
             # Convert chunk to WAV format
@@ -592,12 +574,6 @@ async def stream_tts(
             language=request.language,
             gpt_cond_latent=gpt_cond_latent,
             speaker_embedding=speaker_embedding,
-            speed=request.speed,
-            temperature=request.temperature,
-            length_penalty=request.length_penalty,
-            repetition_penalty=request.repetition_penalty,
-            top_k=request.top_k,
-            top_p=request.top_p,
             enable_text_splitting=request.enable_text_splitting
         )
 
@@ -655,14 +631,7 @@ async def generate_tts(
                 text=request.text,
                 language=request.language,
                 gpt_cond_latent=gpt_cond_latent,
-                speaker_embedding=speaker_embedding,
-                speed=request.speed,
-                temperature=request.temperature,
-                length_penalty=request.length_penalty,
-                repetition_penalty=request.repetition_penalty,
-                top_k=request.top_k,
-                top_p=request.top_p,
-                enable_text_splitting=request.enable_text_splitting
+                speaker_embedding=speaker_embedding
             )
         )
 
@@ -704,7 +673,7 @@ async def websocket_tts(websocket: WebSocket):
     user_id = None
     
     try:
-
+        # First, accept the connection
         await websocket.accept()
         logger.info(f"WebSocket connection accepted: {connection_id}")
         
@@ -722,7 +691,7 @@ async def websocket_tts(websocket: WebSocket):
             user_data = await validate_token(auth_message["token"])
             user_id = user_data.user_id
             
-            # Send welcome message directly (without using ConnectionManager yet)
+            # Send welcome message directly
             await websocket.send_json({
                 "type": "connected",
                 "message": "Connection established",
@@ -735,15 +704,24 @@ async def websocket_tts(websocket: WebSocket):
             # Main message processing loop
             while True:
                 # Wait for TTS request
+                logger.info(f"Waiting for TTS request from client: {connection_id}")
                 message = await websocket.receive_json()
+                logger.info(f"Received message: {message.keys()}")
                 
                 if "request" not in message:
+                    logger.error(f"Invalid message format: {message}")
                     await manager.send_error(connection_id, "Invalid request format")
                     continue
                 
                 try:
-                    # Parse the TTS request
-                    tts_request = TTSRequest(**message["request"])
+                    # Parse the TTS request - only with minimal required fields
+                    request_data = message["request"]
+                    tts_request = TTSRequest(
+                        text=request_data.get("text", ""),
+                        language=request_data.get("language", "en"),
+                        speaker_name=request_data.get("speaker_name"),
+                        enable_text_splitting=request_data.get("enable_text_splitting", True)
+                    )
                     
                     # Validate the request
                     if not tts_request.text:
@@ -776,12 +754,6 @@ async def websocket_tts(websocket: WebSocket):
                         language=tts_request.language,
                         gpt_cond_latent=gpt_cond_latent,
                         speaker_embedding=speaker_embedding,
-                        speed=tts_request.speed,
-                        temperature=tts_request.temperature,
-                        length_penalty=tts_request.length_penalty,
-                        repetition_penalty=tts_request.repetition_penalty,
-                        top_k=tts_request.top_k,
-                        top_p=tts_request.top_p,
                         enable_text_splitting=tts_request.enable_text_splitting
                     ))
                     
