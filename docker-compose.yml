@@ -1,8 +1,12 @@
-version: '3.8'
+version: "3.8"
 
 services:
   tts-api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILDKIT_INLINE_CACHE: 1
     container_name: tts-api
     volumes:
       - ./.env:/app/.env
