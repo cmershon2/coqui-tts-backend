@@ -492,6 +492,7 @@ async def send_audio_chunks_to_websocket(
                 repetition_penalty=repetition_penalty,
                 top_k=top_k,
                 top_p=top_p,
+                pad_token_id=0,
                 **kwargs
             )
             
