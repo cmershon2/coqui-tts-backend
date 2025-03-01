@@ -45,8 +45,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set up working directory
 WORKDIR /app
 
-# Copy Python dependencies files
+# Create a custom requirements file without deepspeed
 COPY requirements.txt ./
+RUN cat requirements.txt | grep -v "deepspeed" > requirements-no-deepspeed.txt
 
 # Copy PyTorch wheels from builder stage
 COPY --from=builder /wheels /wheels
@@ -54,11 +55,11 @@ COPY --from=builder /wheels /wheels
 # Install PyTorch from wheels
 RUN pip3 install --no-cache-dir /wheels/*.whl
 
-# Install Python dependencies
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Install Python dependencies without DeepSpeed
+RUN pip3 install --no-cache-dir -r requirements-no-deepspeed.txt
 
-# Install DeepSpeed separately since it's optional and large
-RUN pip3 install --no-cache-dir deepspeed==0.16.4
+# Install boto3 separately
+RUN pip3 install --no-cache-dir boto3==1.28.40
 
 # Create model directory
 RUN mkdir -p /app/models

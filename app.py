@@ -20,15 +20,8 @@ import boto3
 from dotenv import load_dotenv
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
-
-# Check if DeepSpeed is available
-try:
-    import deepspeed
-    HAS_DEEPSPEED = True
-    logging.info("DeepSpeed is available")
-except ImportError:
-    HAS_DEEPSPEED = False
-    logging.info("DeepSpeed is not available, will use PyTorch only")
+import subprocess
+import sys
 
 # Load environment variables
 load_dotenv()
@@ -39,6 +32,17 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Install DeepSpeed at runtime if needed
+USE_DEEPSPEED = os.getenv("USE_DEEPSPEED", "True").lower() in ("true", "1", "t")
+if USE_DEEPSPEED:
+    try:
+        import deepspeed
+        logger.info("DeepSpeed already installed")
+    except ImportError:
+        logger.info("Installing DeepSpeed...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "deepspeed==0.16.4", "--no-deps"])
+        logger.info("DeepSpeed installed successfully")
 
 # App configuration
 app = FastAPI(
