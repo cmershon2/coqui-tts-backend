@@ -336,6 +336,12 @@ def load_model():
         raise FileNotFoundError(f"Config file not found at {config_path}")
 
     config.load_json(config_path)
+    
+    # Add these lines to explicitly set tokenizer parameters
+    if hasattr(config, 'tokenizer'):
+        if not hasattr(config.tokenizer, 'pad_token_id') or config.tokenizer.pad_token_id is None:
+            config.tokenizer.pad_token_id = 0  # Set a default value
+    
     model = Xtts.init_from_config(config)
 
     # Log DeepSpeed status
@@ -453,20 +459,6 @@ async def send_audio_chunks_to_websocket(
         **kwargs
 ):
     """Generate audio and send chunks to a WebSocket connection"""
-    chunks_generator = generate_audio_chunks(
-        text=text,
-        language=language,
-        gpt_cond_latent=gpt_cond_latent,
-        speaker_embedding=speaker_embedding,
-        speed=speed,
-        temperature=temperature,
-        length_penalty=length_penalty,
-        repetition_penalty=repetition_penalty,
-        top_k=top_k,
-        top_p=top_p,
-        **kwargs
-    )
-    
     try:
         # Send a start message
         await manager.send_message(connection_id, {
@@ -474,27 +466,74 @@ async def send_audio_chunks_to_websocket(
             "message": "Starting audio generation"
         })
         
-        # Stream each audio chunk to the client
-        async for chunk in chunks_generator:
-            await manager.send_audio_chunk(connection_id, chunk)
+        # Log all parameters for debugging
+        logger.info(f"TTS parameters: text='{text[:50]}...', language={language}, " +
+                   f"speed={speed}, temperature={temperature}, top_k={top_k}, top_p={top_p}, " +
+                   f"length_penalty={length_penalty}, repetition_penalty={repetition_penalty}")
+        
+        # Check parameter types - convert to proper types if needed
+        speed = float(speed)
+        temperature = float(temperature)
+        length_penalty = float(length_penalty)
+        repetition_penalty = float(repetition_penalty)
+        top_k = int(top_k)
+        top_p = float(top_p)
+        
+        # Get generator from model
+        try:
+            chunk_generator = model.inference_stream(
+                text=text,
+                language=language,
+                gpt_cond_latent=gpt_cond_latent,
+                speaker_embedding=speaker_embedding,
+                speed=speed,
+                temperature=temperature,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
+                top_k=top_k,
+                top_p=top_p,
+                **kwargs
+            )
             
-        # Send a completion message
-        await manager.send_message(connection_id, {
-            "type": "complete",
-            "message": "Audio generation complete"
-        })
+            # Stream each audio chunk to the client
+            for chunk in chunk_generator:
+                # Convert chunk to WAV format
+                wav_chunk = chunk.cpu().numpy().astype(np.float32)
+                
+                # Create wave file in memory
+                buffer = io.BytesIO()
+                with io.BytesIO() as audio_buffer:
+                    torchaudio.save(
+                        audio_buffer,
+                        torch.tensor(wav_chunk).unsqueeze(0),
+                        SAMPLE_RATE,
+                        format="wav"
+                    )
+                    audio_buffer.seek(0)
+                    buffer.write(audio_buffer.read())
+                
+                buffer.seek(0)
+                
+                # Send chunk to client
+                await manager.send_audio_chunk(connection_id, buffer.read())
+                
+            # Send a completion message
+            await manager.send_message(connection_id, {
+                "type": "complete",
+                "message": "Audio generation complete"
+            })
+            
+        except AttributeError as e:
+            # Handle specific attribute errors
+            if "_pad_token_tensor" in str(e):
+                logger.error(f"Model initialization error - pad token issue: {str(e)}")
+                await manager.send_error(connection_id, "Model initialization error. Please try again with simpler parameters.")
+            else:
+                raise
+                
     except Exception as e:
         logger.error(f"Error in WebSocket streaming: {str(e)}")
         await manager.send_error(connection_id, f"Error generating audio: {str(e)}")
-        
-        # Close the connection on severe errors
-        if connection_id in manager.active_connections:
-            try:
-                await manager.active_connections[connection_id].close(code=status.WS_1011_INTERNAL_ERROR)
-            except Exception:
-                pass
-            manager.disconnect(connection_id)
-
 
 @app.get("/health")
 async def health_check():
