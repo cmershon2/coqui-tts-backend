@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -8,7 +8,7 @@ import time
 import torch
 import torchaudio
 import numpy as np
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 import httpx
 import logging
 from pathlib import Path
@@ -16,6 +16,7 @@ import asyncio
 import uvicorn
 import json
 import boto3
+import base64
 
 from dotenv import load_dotenv
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -84,6 +85,60 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # Use service key for backend
 if not (SUPABASE_URL and SUPABASE_KEY):
     logger.warning("Supabase credentials not fully configured. Authentication will not work correctly.")
 
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.user_connections: Dict[str, Set[str]] = {}  # Map user_id to set of connection_ids
+
+    async def connect(self, websocket: WebSocket, connection_id: str, user_id: str):
+        await websocket.accept()
+        self.active_connections[connection_id] = websocket
+        
+        # Add connection to user's list
+        if user_id not in self.user_connections:
+            self.user_connections[user_id] = set()
+        self.user_connections[user_id].add(connection_id)
+        
+        logger.info(f"Client connected: {connection_id} (user: {user_id})")
+
+    def disconnect(self, connection_id: str):
+        if connection_id in self.active_connections:
+            # Find and remove from user connections
+            for user_id, connections in self.user_connections.items():
+                if connection_id in connections:
+                    connections.remove(connection_id)
+                    if len(connections) == 0:
+                        # Clean up empty user entries
+                        del self.user_connections[user_id]
+                    break
+            
+            # Remove from active connections
+            del self.active_connections[connection_id]
+            logger.info(f"Client disconnected: {connection_id}")
+
+    async def send_audio_chunk(self, connection_id: str, chunk: bytes):
+        if connection_id in self.active_connections:
+            # Encode audio chunk as base64 for sending over WebSocket
+            base64_chunk = base64.b64encode(chunk).decode('utf-8')
+            await self.active_connections[connection_id].send_json({
+                "type": "audio_chunk",
+                "data": base64_chunk
+            })
+
+    async def send_message(self, connection_id: str, message: Dict):
+        if connection_id in self.active_connections:
+            await self.active_connections[connection_id].send_json(message)
+
+    async def send_error(self, connection_id: str, error_message: str):
+        if connection_id in self.active_connections:
+            await self.active_connections[connection_id].send_json({
+                "type": "error",
+                "message": error_message
+            })
+
+# Initialize connection manager
+manager = ConnectionManager()
 
 # Request models
 class TTSRequest(BaseModel):
@@ -114,6 +169,12 @@ class TTSRequest(BaseModel):
 class TokenValidationResponse(BaseModel):
     user_id: str
     role: str
+
+
+# WebSocket message model
+class WebSocketTTSRequest(BaseModel):
+    token: str
+    request: TTSRequest
 
 
 # Global model variable
@@ -198,13 +259,9 @@ def download_model_from_s3():
         return False
 
 # Helper functions for authentication
-async def validate_token(request: Request) -> TokenValidationResponse:
-    auth_header = request.headers.get("Authorization")
-
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authentication token")
-
-    token = auth_header.replace("Bearer ", "")
+async def validate_token(token: str) -> TokenValidationResponse:
+    if not token:
+        raise ValueError("Missing authentication token")
 
     async with httpx.AsyncClient() as client:
         try:
@@ -218,7 +275,7 @@ async def validate_token(request: Request) -> TokenValidationResponse:
             )
 
             if response.status_code != 200:
-                raise HTTPException(status_code=401, detail="Invalid authentication token")
+                raise ValueError("Invalid authentication token")
 
             user_data = response.json()
             return TokenValidationResponse(
@@ -228,12 +285,25 @@ async def validate_token(request: Request) -> TokenValidationResponse:
 
         except Exception as e:
             logger.error(f"Authentication error: {str(e)}")
-            raise HTTPException(status_code=401, detail="Authentication failed")
+            raise ValueError(f"Authentication failed: {str(e)}")
+
+
+async def validate_http_token(request: Request) -> TokenValidationResponse:
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+
+    token = auth_header.replace("Bearer ", "")
+    try:
+        return await validate_token(token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
 
 # Dependency for authentication
 async def get_current_user(request: Request) -> TokenValidationResponse:
-    return await validate_token(request)
+    return await validate_http_token(request)
 
 
 # Load model on startup
@@ -272,7 +342,7 @@ def load_model():
     if USE_DEEPSPEED:
         logger.info("Loading model with DeepSpeed optimization")
     else:
-            logger.info("DeepSpeed is not available or is disabled, using PyTorch only")
+        logger.info("DeepSpeed is not available or is disabled, using PyTorch only")
 
     checkpoint_path = CHECKPOINT_DIR
     model.load_checkpoint(config, checkpoint_dir=checkpoint_path, use_deepspeed=USE_DEEPSPEED)
@@ -366,6 +436,64 @@ async def generate_audio_chunks(
     except Exception as e:
         logger.error(f"Error generating audio: {str(e)}")
         raise
+
+
+async def send_audio_chunks_to_websocket(
+        connection_id: str,
+        text: str, 
+        language: str, 
+        gpt_cond_latent, 
+        speaker_embedding,
+        speed=1.0, 
+        temperature=0.65, 
+        length_penalty=1.0,
+        repetition_penalty=2.0, 
+        top_k=50, 
+        top_p=0.8, 
+        **kwargs
+):
+    """Generate audio and send chunks to a WebSocket connection"""
+    chunks_generator = generate_audio_chunks(
+        text=text,
+        language=language,
+        gpt_cond_latent=gpt_cond_latent,
+        speaker_embedding=speaker_embedding,
+        speed=speed,
+        temperature=temperature,
+        length_penalty=length_penalty,
+        repetition_penalty=repetition_penalty,
+        top_k=top_k,
+        top_p=top_p,
+        **kwargs
+    )
+    
+    try:
+        # Send a start message
+        await manager.send_message(connection_id, {
+            "type": "start",
+            "message": "Starting audio generation"
+        })
+        
+        # Stream each audio chunk to the client
+        async for chunk in chunks_generator:
+            await manager.send_audio_chunk(connection_id, chunk)
+            
+        # Send a completion message
+        await manager.send_message(connection_id, {
+            "type": "complete",
+            "message": "Audio generation complete"
+        })
+    except Exception as e:
+        logger.error(f"Error in WebSocket streaming: {str(e)}")
+        await manager.send_error(connection_id, f"Error generating audio: {str(e)}")
+        
+        # Close the connection on severe errors
+        if connection_id in manager.active_connections:
+            try:
+                await manager.active_connections[connection_id].close(code=status.WS_1011_INTERNAL_ERROR)
+            except Exception:
+                pass
+            manager.disconnect(connection_id)
 
 
 @app.get("/health")
@@ -560,6 +688,121 @@ async def generate_tts(
     except Exception as e:
         logger.error(f"Error in generate_tts: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/ws/tts")
+async def websocket_tts(websocket: WebSocket):
+    """WebSocket endpoint for real-time TTS streaming"""
+    if model is None:
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER, reason="Server is initializing")
+        return
+
+    connection_id = f"conn_{int(time.time() * 1000)}_{id(websocket)}"
+    user_id = None
+    
+    try:
+        # Accept the connection initially
+        await websocket.accept()
+        
+        # Wait for authentication message
+        auth_message = await websocket.receive_json()
+        
+        # Validate authentication token
+        if "token" not in auth_message:
+            await websocket.send_json({"type": "error", "message": "Missing authentication token"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+            
+        try:
+            # Validate the token
+            user_data = await validate_token(auth_message["token"])
+            user_id = user_data.user_id
+            
+            # Now complete the connection process with the connection manager
+            await manager.connect(websocket, connection_id, user_id)
+            
+            # Send welcome message
+            await manager.send_message(connection_id, {
+                "type": "connected",
+                "message": "Connection established",
+                "user_id": user_id
+            })
+            
+            # Main message processing loop
+            while True:
+                # Wait for TTS request
+                message = await websocket.receive_json()
+                
+                if "request" not in message:
+                    await manager.send_error(connection_id, "Invalid request format")
+                    continue
+                
+                try:
+                    # Parse the TTS request
+                    tts_request = TTSRequest(**message["request"])
+                    
+                    # Validate the request
+                    if not tts_request.text:
+                        await manager.send_error(connection_id, "Text is required")
+                        continue
+                        
+                    if not tts_request.speaker_name and not tts_request.speaker_wav:
+                        await manager.send_error(connection_id, "Either speaker_name or speaker_wav must be provided")
+                        continue
+                    
+                    # Determine speaker key for caching
+                    if tts_request.speaker_name:
+                        speaker_key = f"name:{tts_request.speaker_name}"
+                        gpt_cond_latent, speaker_embedding = await get_speaker_embedding(
+                            speaker_key=speaker_key,
+                            speaker_name=tts_request.speaker_name
+                        )
+                    else:
+                        # For voice cloning, use the first file path as key
+                        speaker_key = f"wav:{tts_request.speaker_wav[0]}"
+                        gpt_cond_latent, speaker_embedding = await get_speaker_embedding(
+                            speaker_key=speaker_key,
+                            speaker_files=tts_request.speaker_wav
+                        )
+                    
+                    # Process the request in the background to avoid blocking the WebSocket
+                    asyncio.create_task(send_audio_chunks_to_websocket(
+                        connection_id=connection_id,
+                        text=tts_request.text,
+                        language=tts_request.language,
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        speed=tts_request.speed,
+                        temperature=tts_request.temperature,
+                        length_penalty=tts_request.length_penalty,
+                        repetition_penalty=tts_request.repetition_penalty,
+                        top_k=tts_request.top_k,
+                        top_p=tts_request.top_p,
+                        enable_text_splitting=tts_request.enable_text_splitting
+                    ))
+                    
+                except Exception as e:
+                    logger.error(f"Error processing WebSocket request: {str(e)}")
+                    await manager.send_error(connection_id, f"Error processing request: {str(e)}")
+                
+        except ValueError as e:
+            # Authentication failed
+            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+            
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client disconnected: {connection_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+        try:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        except Exception:
+            pass
+    finally:
+        # Always clean up the connection
+        if connection_id:
+            manager.disconnect(connection_id)
 
 
 if __name__ == "__main__":
