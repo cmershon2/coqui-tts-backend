@@ -424,7 +424,7 @@ async def send_audio_chunks_to_websocket(
         speaker_embedding,
         enable_text_splitting=True
 ):
-    """Generate audio and send chunks to a WebSocket connection - simplified to match Coqui's example"""
+    """Generate audio and send chunks to a WebSocket connection"""
     try:
         # Send a start message
         await manager.send_message(connection_id, {
@@ -435,50 +435,197 @@ async def send_audio_chunks_to_websocket(
         # Log parameters for debugging
         logger.info(f"TTS parameters: text='{text[:50]}...', language={language}")
         
-        # Get generator from model with minimal parameters, following Coqui's example
+        # Instead of using inference_stream which might be causing issues,
+        # let's adapt the approach from the working REST implementation
+        # We'll use run_in_executor to make it non-blocking
+        
         loop = asyncio.get_event_loop()
-        chunk_generator = await loop.run_in_executor(
-            None,
-            lambda: model.inference_stream(
-                text=text,
-                language=language,
-                gpt_cond_latent=gpt_cond_latent,
-                speaker_embedding=speaker_embedding,
-                enable_text_splitting=enable_text_splitting
-            )
-        )
         
-        # Stream each audio chunk to the client
-        for chunk in chunk_generator:
-            # Convert chunk to WAV format
-            wav_chunk = chunk.cpu().numpy().astype(np.float32)
-            
-            # Create wave file in memory
-            buffer = io.BytesIO()
-            with io.BytesIO() as audio_buffer:
-                torchaudio.save(
-                    audio_buffer,
-                    torch.tensor(wav_chunk).unsqueeze(0),
-                    SAMPLE_RATE,
-                    format="wav"
+        # Create a function that will wrap the inference and chunk handling 
+        async def generate_and_send():
+            try:
+                # Perform inference using the basic inference method, which we know works
+                out = await loop.run_in_executor(
+                    None,
+                    lambda: model.inference(
+                        text=text,
+                        language=language,
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        enable_text_splitting=enable_text_splitting
+                    )
                 )
-                audio_buffer.seek(0)
-                buffer.write(audio_buffer.read())
-            
-            buffer.seek(0)
-            
-            # Send chunk to client
-            await manager.send_audio_chunk(connection_id, buffer.read())
-            
-        # Send a completion message
-        await manager.send_message(connection_id, {
-            "type": "complete",
-            "message": "Audio generation complete"
-        })
+                
+                # Get the waveform
+                wav = out["wav"]
+                
+                # Split the waveform into chunks for streaming
+                # Using 0.5 second chunks (sample_rate * 0.5 samples)
+                chunk_size = int(SAMPLE_RATE * 0.5)
+                wav_len = len(wav)
+                
+                # Create and send chunks
+                for i in range(0, wav_len, chunk_size):
+                    # Get the chunk
+                    chunk_end = min(i + chunk_size, wav_len)
+                    wav_chunk = wav[i:chunk_end]
+                    
+                    # Convert to tensor and create WAV
+                    buffer = io.BytesIO()
+                    with io.BytesIO() as audio_buffer:
+                        torchaudio.save(
+                            audio_buffer,
+                            torch.tensor(wav_chunk).unsqueeze(0),
+                            SAMPLE_RATE,
+                            format="wav"
+                        )
+                        audio_buffer.seek(0)
+                        buffer.write(audio_buffer.read())
+                    
+                    buffer.seek(0)
+                    
+                    # Send the chunk
+                    await manager.send_audio_chunk(connection_id, buffer.read())
+                    
+                    # Small delay to prevent overwhelming the client
+                    await asyncio.sleep(0.05)
+                
+                # Send completion message
+                await manager.send_message(connection_id, {
+                    "type": "complete",
+                    "message": "Audio generation complete"
+                })
+                
+            except Exception as e:
+                logger.error(f"Error generating audio chunks: {str(e)}")
+                await manager.send_error(connection_id, f"Error generating audio: {str(e)}")
         
+        # Start the generation and sending process
+        asyncio.create_task(generate_and_send())
+            
     except Exception as e:
         logger.error(f"Error in WebSocket streaming: {str(e)}")
         await manager.send_error(connection_id, f"Error generating audio: {str(e)}")
+
+
+@app.websocket("/ws/tts")
+async def websocket_tts(websocket: WebSocket):
+    """WebSocket endpoint for real-time TTS streaming"""
+    if model is None:
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER, reason="Server is initializing")
+        return
+
+    connection_id = f"conn_{int(time.time() * 1000)}_{id(websocket)}"
+    user_id = None
+    
+    try:
+        # First, accept the connection
+        await websocket.accept()
+        logger.info(f"WebSocket connection accepted: {connection_id}")
+        
+        # Wait for authentication message
+        auth_message = await websocket.receive_json()
+        
+        # Validate authentication token
+        if "token" not in auth_message:
+            await websocket.send_json({"type": "error", "message": "Missing authentication token"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+            
+        try:
+            # Validate the token
+            user_data = await validate_token(auth_message["token"])
+            user_id = user_data.user_id
+            
+            # Send welcome message directly
+            await websocket.send_json({
+                "type": "connected",
+                "message": "Connection established",
+                "user_id": user_id
+            })
+            
+            # Now add to connection manager
+            await manager.connect(websocket, connection_id, user_id)
+            
+            # Main message processing loop
+            while True:
+                # Wait for TTS request
+                logger.info(f"Waiting for TTS request from client: {connection_id}")
+                message = await websocket.receive_json()
+                logger.info(f"Received message from client: {connection_id}")
+                
+                if "request" not in message:
+                    logger.error(f"Invalid message format: {message}")
+                    await manager.send_error(connection_id, "Invalid request format")
+                    continue
+                
+                try:
+                    # Extract the request data
+                    request_data = message["request"]
+                    
+                    # Validate required fields
+                    if "text" not in request_data or not request_data["text"]:
+                        await manager.send_error(connection_id, "Text is required")
+                        continue
+                        
+                    if "speaker_name" not in request_data and ("speaker_wav" not in request_data or not request_data["speaker_wav"]):
+                        await manager.send_error(connection_id, "Either speaker_name or speaker_wav must be provided")
+                        continue
+                    
+                    # Extract parameters
+                    text = request_data["text"]
+                    language = request_data.get("language", "en")
+                    enable_text_splitting = request_data.get("enable_text_splitting", True)
+                    
+                    # Get speaker embeddings
+                    if "speaker_name" in request_data and request_data["speaker_name"]:
+                        speaker_name = request_data["speaker_name"]
+                        speaker_key = f"name:{speaker_name}"
+                        gpt_cond_latent, speaker_embedding = await get_speaker_embedding(
+                            speaker_key=speaker_key,
+                            speaker_name=speaker_name
+                        )
+                    else:
+                        # For voice cloning
+                        speaker_wav = request_data["speaker_wav"]
+                        speaker_key = f"wav:{speaker_wav[0]}"
+                        gpt_cond_latent, speaker_embedding = await get_speaker_embedding(
+                            speaker_key=speaker_key,
+                            speaker_files=speaker_wav
+                        )
+                    
+                    # Process the request
+                    await send_audio_chunks_to_websocket(
+                        connection_id=connection_id,
+                        text=text,
+                        language=language,
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        enable_text_splitting=enable_text_splitting
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error processing WebSocket request: {str(e)}")
+                    await manager.send_error(connection_id, f"Error processing request: {str(e)}")
+                
+        except ValueError as e:
+            # Authentication failed
+            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+            
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client disconnected: {connection_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+        try:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        except Exception:
+            pass
+    finally:
+        # Always clean up the connection
+        if connection_id:
+            manager.disconnect(connection_id)
 
 
 @app.get("/health")
@@ -706,7 +853,7 @@ async def websocket_tts(websocket: WebSocket):
                 # Wait for TTS request
                 logger.info(f"Waiting for TTS request from client: {connection_id}")
                 message = await websocket.receive_json()
-                logger.info(f"Received message: {message.keys()}")
+                logger.info(f"Received message from client: {connection_id}")
                 
                 if "request" not in message:
                     logger.error(f"Invalid message format: {message}")
@@ -714,47 +861,48 @@ async def websocket_tts(websocket: WebSocket):
                     continue
                 
                 try:
-                    # Parse the TTS request - only with minimal required fields
+                    # Parse the TTS request - match the full REST API parameters
                     request_data = message["request"]
-                    tts_request = TTSRequest(
-                        text=request_data.get("text", ""),
-                        language=request_data.get("language", "en"),
-                        speaker_name=request_data.get("speaker_name"),
-                        enable_text_splitting=request_data.get("enable_text_splitting", True)
-                    )
                     
-                    # Validate the request
-                    if not tts_request.text:
+                    # Validate required fields manually
+                    if "text" not in request_data or not request_data["text"]:
                         await manager.send_error(connection_id, "Text is required")
                         continue
                         
-                    if not tts_request.speaker_name and not tts_request.speaker_wav:
+                    if "speaker_name" not in request_data and ("speaker_wav" not in request_data or not request_data["speaker_wav"]):
                         await manager.send_error(connection_id, "Either speaker_name or speaker_wav must be provided")
                         continue
                     
+                    # Get text and language
+                    text = request_data["text"]
+                    language = request_data.get("language", "en")
+                    enable_text_splitting = request_data.get("enable_text_splitting", True)
+                    
                     # Determine speaker key for caching
-                    if tts_request.speaker_name:
-                        speaker_key = f"name:{tts_request.speaker_name}"
+                    if "speaker_name" in request_data and request_data["speaker_name"]:
+                        speaker_name = request_data["speaker_name"]
+                        speaker_key = f"name:{speaker_name}"
                         gpt_cond_latent, speaker_embedding = await get_speaker_embedding(
                             speaker_key=speaker_key,
-                            speaker_name=tts_request.speaker_name
+                            speaker_name=speaker_name
                         )
                     else:
                         # For voice cloning, use the first file path as key
-                        speaker_key = f"wav:{tts_request.speaker_wav[0]}"
+                        speaker_wav = request_data["speaker_wav"]
+                        speaker_key = f"wav:{speaker_wav[0]}"
                         gpt_cond_latent, speaker_embedding = await get_speaker_embedding(
                             speaker_key=speaker_key,
-                            speaker_files=tts_request.speaker_wav
+                            speaker_files=speaker_wav
                         )
                     
                     # Process the request in the background to avoid blocking the WebSocket
                     asyncio.create_task(send_audio_chunks_to_websocket(
                         connection_id=connection_id,
-                        text=tts_request.text,
-                        language=tts_request.language,
+                        text=text,
+                        language=language,
                         gpt_cond_latent=gpt_cond_latent,
                         speaker_embedding=speaker_embedding,
-                        enable_text_splitting=tts_request.enable_text_splitting
+                        enable_text_splitting=enable_text_splitting
                     ))
                     
                 except Exception as e:
@@ -779,7 +927,6 @@ async def websocket_tts(websocket: WebSocket):
         # Always clean up the connection
         if connection_id:
             manager.disconnect(connection_id)
-
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
